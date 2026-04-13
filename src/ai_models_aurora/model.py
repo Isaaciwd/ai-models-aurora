@@ -71,6 +71,91 @@ class AuroraModel(Model):
     lora = None
     supported_attribution_methods = ("gradient", "integrated-gradients")
 
+    surf_scales = {
+        "2t": 2.122036e01,
+        "10u": 5.547512e00,
+        "10v": 4.765339e00,
+        "msl": 1.332246e03,
+    }
+
+    atmos_scales = {
+        "z": {
+            50: 5.875553e03,
+            100: 5.510640e03,
+            150: 5.823912e03,
+            200: 5.820169e03,
+            250: 5.536585e03,
+            300: 5.091916e03,
+            400: 4.150851e03,
+            500: 3.353187e03,
+            600: 2.695808e03,
+            700: 2.136436e03,
+            850: 1.470321e03,
+            925: 1.228997e03,
+            1000: 1.072307e03,
+        },
+        "u": {
+            50: 1.529281e01,
+            100: 1.352611e01,
+            150: 1.604335e01,
+            200: 1.767630e01,
+            250: 1.796710e01,
+            300: 1.711917e01,
+            400: 1.434276e01,
+            500: 1.198419e01,
+            600: 1.033421e01,
+            700: 9.168821e00,
+            850: 8.188043e00,
+            925: 7.940808e00,
+            1000: 6.141778e00,
+        },
+        "v": {
+            50: 7.058931e00,
+            100: 7.479310e00,
+            150: 9.571990e00,
+            200: 1.188069e01,
+            250: 1.338039e01,
+            300: 1.334044e01,
+            400: 1.122955e01,
+            500: 9.181708e00,
+            600: 7.803569e00,
+            700: 6.871040e00,
+            850: 6.264443e00,
+            925: 6.470644e00,
+            1000: 5.308203e00,
+        },
+        "t": {
+            50: 1.026284e01,
+            100: 1.252901e01,
+            150: 8.928709e00,
+            200: 7.189547e00,
+            250: 8.529282e00,
+            300: 1.071679e01,
+            400: 1.269102e01,
+            500: 1.306447e01,
+            600: 1.342046e01,
+            700: 1.476523e01,
+            850: 1.558880e01,
+            925: 1.608798e01,
+            1000: 1.713983e01,
+        },
+        "q": {
+            50: 3.571687e-07,
+            100: 5.703754e-07,
+            150: 3.794077e-06,
+            200: 2.267534e-05,
+            250: 7.446644e-05,
+            300: 1.684361e-04,
+            400: 5.078644e-04,
+            500: 1.079294e-03,
+            600: 1.769722e-03,
+            700: 2.549169e-03,
+            850: 4.112368e-03,
+            925: 5.071058e-03,
+            1000: 5.913548e-03,
+        },
+    }
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.ordering = list(self.surf_vars) + [
@@ -421,6 +506,15 @@ class AuroraModel(Model):
             return total_sum / float(total_count)
 
         field_values = self._target_tensor(prediction, target.field)
+
+        # Aurora returns unnormalized outputs. For consistent sensitivity scaling
+        # with other plugins, compute objectives in normalized units.
+        kind, param, level = self.channel_to_variable_level(target.field)
+        if kind == "surf":
+            scale = self.surf_scales[param]
+        else:
+            scale = self.atmos_scales[param][int(level)]
+        field_values = field_values / float(scale)
         if target.area is None:
             if metric == "mean":
                 return field_values.mean()

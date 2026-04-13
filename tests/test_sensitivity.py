@@ -121,3 +121,42 @@ def test_zero_baseline_batch_is_zero_for_inputs():
         assert torch.allclose(tensor, torch.zeros_like(tensor))
     for tensor in baseline.atmos_vars.values():
         assert torch.allclose(tensor, torch.zeros_like(tensor))
+
+
+def test_sensitivity_objective_normalizes_surface_field_target():
+    model = _model_stub()
+    scale = model.surf_scales["2t"]
+
+    prediction = type("PredictionLike", (), {})()
+    prediction.surf_vars = {
+        "2t": torch.tensor([[[[0.0]], [[scale]]]], dtype=torch.float32),
+    }
+    prediction.atmos_vars = {
+        "q": torch.zeros((1, 2, len(model.levels), 1, 1), dtype=torch.float32),
+    }
+    prediction.metadata = None
+
+    target = SensitivityTarget(name="two-t", field="2t", area=None, metric="mean")
+    objective = model.sensitivity_objective(prediction, target)
+
+    assert torch.isclose(objective, torch.tensor(1.0))
+
+
+def test_sensitivity_objective_normalizes_pressure_field_target():
+    model = _model_stub()
+    scale = model.atmos_scales["q"][700]
+
+    q_values = torch.zeros((1, 2, len(model.levels), 1, 1), dtype=torch.float32)
+    q_values[0, -1, model.level_to_index[700], 0, 0] = scale
+
+    prediction = type("PredictionLike", (), {})()
+    prediction.surf_vars = {
+        "2t": torch.zeros((1, 2, 1, 1), dtype=torch.float32),
+    }
+    prediction.atmos_vars = {"q": q_values}
+    prediction.metadata = None
+
+    target = SensitivityTarget(name="q700", field="q700", area=None, metric="mean-square")
+    objective = model.sensitivity_objective(prediction, target)
+
+    assert torch.isclose(objective, torch.tensor(1.0))
