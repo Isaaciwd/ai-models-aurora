@@ -69,6 +69,7 @@ class AuroraModel(Model):
 
     expver = "auro"
     lora = None
+    supported_attribution_methods = ("gradient", "integrated-gradients")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -455,6 +456,154 @@ class AuroraModel(Model):
 
         return np.stack(channel_maps, axis=0)
 
+    @staticmethod
+    def _clone_batch_to_device(batch, device):
+        return Batch(
+            surf_vars={name: tensor.to(device).detach().clone() for name, tensor in batch.surf_vars.items()},
+            static_vars={name: tensor.to(device) for name, tensor in batch.static_vars.items()},
+            atmos_vars={name: tensor.to(device).detach().clone() for name, tensor in batch.atmos_vars.items()},
+            metadata=Metadata(
+                lat=batch.metadata.lat.to(device),
+                lon=batch.metadata.lon.to(device),
+                time=batch.metadata.time,
+                atmos_levels=batch.metadata.atmos_levels,
+                rollout_step=batch.metadata.rollout_step,
+            ),
+        )
+
+    @staticmethod
+    def _batch_with_requires_grad(batch):
+        return Batch(
+            surf_vars={name: tensor.detach().clone().requires_grad_(True) for name, tensor in batch.surf_vars.items()},
+            static_vars=batch.static_vars,
+            atmos_vars={name: tensor.detach().clone().requires_grad_(True) for name, tensor in batch.atmos_vars.items()},
+            metadata=batch.metadata,
+        )
+
+    def _batch_delta(self, batch, baseline):
+        return Batch(
+            surf_vars={name: batch.surf_vars[name] - baseline.surf_vars[name] for name in self.surf_vars},
+            static_vars=baseline.static_vars,
+            atmos_vars={name: batch.atmos_vars[name] - baseline.atmos_vars[name] for name in self.atmos_vars},
+            metadata=batch.metadata,
+        )
+
+    def _batch_add_scaled(self, baseline, delta, alpha):
+        return Batch(
+            surf_vars={
+                name: baseline.surf_vars[name] + alpha * delta.surf_vars[name]
+                for name in self.surf_vars
+            },
+            static_vars=baseline.static_vars,
+            atmos_vars={
+                name: baseline.atmos_vars[name] + alpha * delta.atmos_vars[name]
+                for name in self.atmos_vars
+            },
+            metadata=baseline.metadata,
+        )
+
+    def _zero_baseline_batch(self, batch):
+        return Batch(
+            surf_vars={name: torch.zeros_like(tensor) for name, tensor in batch.surf_vars.items()},
+            static_vars=batch.static_vars,
+            atmos_vars={name: torch.zeros_like(tensor) for name, tensor in batch.atmos_vars.items()},
+            metadata=batch.metadata,
+        )
+
+    def _climatology_baseline_batch(self, batch):
+        means = torch.zeros((len(self.ordering),), dtype=torch.float32, device=self.device)
+        for index, field in enumerate(self.ordering):
+            kind, param, level = self.channel_to_variable_level(field)
+            if kind == "surf":
+                tensor = batch.surf_vars[param]
+            else:
+                level_index = self.level_to_index[int(level)]
+                tensor = batch.atmos_vars[param][:, :, level_index]
+            means[index] = tensor.mean()
+
+        surf_baseline = {}
+        for param in self.surf_vars:
+            channel_index = self.ordering.index(param)
+            surf_baseline[param] = torch.ones_like(batch.surf_vars[param]) * means[channel_index]
+
+        atmos_baseline = {}
+        for param in self.atmos_vars:
+            channels = [self.ordering.index(f"{param}{level}") for level in self.levels]
+            channel_means = means[channels].view(1, 1, len(self.levels), 1, 1)
+            atmos_baseline[param] = torch.ones_like(batch.atmos_vars[param]) * channel_means
+
+        return Batch(
+            surf_vars=surf_baseline,
+            static_vars=batch.static_vars,
+            atmos_vars=atmos_baseline,
+            metadata=batch.metadata,
+        )
+
+    def integrated_gradients_baseline(self, batch):
+        baseline_mode = getattr(self, "ig_baseline", "zero")
+        if baseline_mode == "zero":
+            return self._zero_baseline_batch(batch)
+        if baseline_mode == "climatology":
+            return self._climatology_baseline_batch(batch)
+        raise ValueError(f"Unsupported integrated gradients baseline: {baseline_mode}")
+
+    def _objective_from_batch(self, model, current_batch, forecast_steps, target):
+        current = current_batch.crop(model.patch_size)
+        objective_batch = None
+
+        for _ in range(forecast_steps):
+            prediction = self.model_step(model, current)
+            objective_batch = prediction
+            current = self.advance_rollout(current, prediction)
+
+        if objective_batch is None:
+            raise ValueError("Sensitivity rollout produced no prediction steps")
+
+        self.sensitivity_manager.current_target = target
+        return self.sensitivity_manager.objective(objective_batch, target)
+
+    def integrated_gradients(self, model, input_batch, forecast_steps, target):
+        steps = int(self.ig_steps)
+        baseline = self.integrated_gradients_baseline(input_batch)
+        delta = self._batch_delta(input_batch, baseline)
+
+        surf_accum = {name: torch.zeros_like(delta.surf_vars[name]) for name in self.surf_vars}
+        atmos_accum = {name: torch.zeros_like(delta.atmos_vars[name]) for name in self.atmos_vars}
+
+        for step in range(1, steps + 1):
+            alpha = float(step) / float(steps)
+            interpolated = self._batch_add_scaled(baseline, delta, alpha)
+            interpolated = self._batch_with_requires_grad(interpolated)
+
+            objective = self._objective_from_batch(model, interpolated, forecast_steps, target)
+
+            grad_inputs = [interpolated.surf_vars[name] for name in self.surf_vars] + [
+                interpolated.atmos_vars[name] for name in self.atmos_vars
+            ]
+            grads = torch.autograd.grad(objective, grad_inputs)
+
+            for idx, name in enumerate(self.surf_vars):
+                surf_accum[name] = surf_accum[name] + grads[idx]
+            base_idx = len(self.surf_vars)
+            for idx, name in enumerate(self.atmos_vars):
+                atmos_accum[name] = atmos_accum[name] + grads[base_idx + idx]
+
+        surf_attr = {
+            name: delta.surf_vars[name] * (surf_accum[name] / float(steps))
+            for name in self.surf_vars
+        }
+        atmos_attr = {
+            name: delta.atmos_vars[name] * (atmos_accum[name] / float(steps))
+            for name in self.atmos_vars
+        }
+
+        return Batch(
+            surf_vars=surf_attr,
+            static_vars=input_batch.static_vars,
+            atmos_vars=atmos_attr,
+            metadata=input_batch.metadata,
+        )
+
     def run_forecast(self, model, batch, templates, nj, ni):
         forecast_steps = self.forecast_step_count()
         current_batch = batch.crop(model.patch_size)
@@ -472,34 +621,16 @@ class AuroraModel(Model):
         forecast_steps = self.forecast_step_count()
         lag_zero_index = list(self.lagged).index(0) if 0 in self.lagged else len(self.lagged) - 1
 
-        surface_inputs = {
-            name: tensor.to(self.device).detach().clone().requires_grad_(True)
-            for name, tensor in batch.surf_vars.items()
-        }
-        atmospheric_inputs = {
-            name: tensor.to(self.device).detach().clone().requires_grad_(True)
-            for name, tensor in batch.atmos_vars.items()
-        }
-        static_inputs = {name: tensor.to(self.device) for name, tensor in batch.static_vars.items()}
+        base_batch = self._clone_batch_to_device(batch, self.device)
+        base_batch = base_batch.crop(model.patch_size)
+        current_batch = self._batch_with_requires_grad(base_batch)
+        gradient_inputs = current_batch
 
-        metadata = Metadata(
-            lat=batch.metadata.lat.to(self.device),
-            lon=batch.metadata.lon.to(self.device),
-            time=batch.metadata.time,
-            atmos_levels=batch.metadata.atmos_levels,
-            rollout_step=batch.metadata.rollout_step,
+        self._sensitivity_latitudes = base_batch.metadata.lat.detach().cpu().numpy().astype(np.float32)
+        self._sensitivity_longitudes = np.mod(
+            base_batch.metadata.lon.detach().cpu().numpy().astype(np.float32),
+            360.0,
         )
-
-        current_batch = Batch(
-            surf_vars=surface_inputs,
-            static_vars=static_inputs,
-            atmos_vars=atmospheric_inputs,
-            metadata=metadata,
-        )
-        current_batch = current_batch.crop(model.patch_size)
-
-        self._sensitivity_latitudes = metadata.lat.detach().cpu().numpy().astype(np.float32)
-        self._sensitivity_longitudes = np.mod(metadata.lon.detach().cpu().numpy().astype(np.float32), 360.0)
 
         objective_batch = None
         with self.stepper(6) as stepper:
@@ -519,20 +650,33 @@ class AuroraModel(Model):
             self.sensitivity_manager.current_target = target
             objectives.append(self.sensitivity_manager.objective(objective_batch, target))
 
-        input_tensors = [surface_inputs[name] for name in self.surf_vars] + [
-            atmospheric_inputs[name] for name in self.atmos_vars
-        ]
-
         gradients = []
         objective_values = []
-        for index, objective in enumerate(objectives):
-            gradient_tensors = torch.autograd.grad(
-                objective,
-                input_tensors,
-                retain_graph=(index < len(objectives) - 1),
-            )
-            gradients.append(self.gradients_to_channel_maps(gradient_tensors, lag_zero_index))
-            objective_values.append(float(objective.detach().cpu()))
+        if self.attribution_method == "gradient":
+            input_tensors = [gradient_inputs.surf_vars[name] for name in self.surf_vars] + [
+                gradient_inputs.atmos_vars[name] for name in self.atmos_vars
+            ]
+            for index, objective in enumerate(objectives):
+                gradient_tensors = torch.autograd.grad(
+                    objective,
+                    input_tensors,
+                    retain_graph=(index < len(objectives) - 1),
+                )
+                gradients.append(self.gradients_to_channel_maps(gradient_tensors, lag_zero_index))
+                objective_values.append(float(objective.detach().cpu()))
+        elif self.attribution_method == "integrated-gradients":
+            for target in self.sensitivity_manager.targets:
+                self.sensitivity_manager.current_target = target
+                attribution_batch = self.integrated_gradients(model, base_batch, forecast_steps, target)
+                objective = self._objective_from_batch(model, base_batch, forecast_steps, target)
+
+                tensors = [attribution_batch.surf_vars[name] for name in self.surf_vars] + [
+                    attribution_batch.atmos_vars[name] for name in self.atmos_vars
+                ]
+                gradients.append(self.gradients_to_channel_maps(tensors, lag_zero_index))
+                objective_values.append(float(objective.detach().cpu()))
+        else:
+            raise ValueError(f"Unsupported attribution method: {self.attribution_method}")
 
         stacked_gradients = np.stack(gradients, axis=0)
         self.sensitivity_manager.save(stacked_gradients, objective_values)

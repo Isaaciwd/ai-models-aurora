@@ -1,0 +1,41 @@
+model: aurora
+model_version: 0.25-pretrained
+download_assets: true
+
+run:
+  input: cds
+  output: none
+  only_gpu: true
+  date: 20230110
+  time: 0000
+  lead_time: 24
+  # attribution_method: gradient
+  # attribution_method: integrated-gradients
+  # ig_steps: 16
+  # ig_baseline: zero
+  # ig_baseline: climatology
+
+runtime:
+  run_dir: "{repo_root}/aurora-runs/{job_id}"
+  assets_dir: "{repo_root}/assets/aurora"
+  omp_num_threads: 1
+  mkl_num_threads: 1
+  mpl_backend: Agg
+
+output:
+  path: ./sensitivity-results.nc
+  summary_path: ./sensitivity-results.json
+
+plotting:
+  enabled: true
+  prefix: ./sensitivity-results
+  top_k: 6
+  area: [60, 200, 10, 280]
+  coastlines: true
+  signed_gradients: true
+
+targets:
+  - name: west-coast-t500
+    field: t500
+    area: [50, 230, 30, 245]
+    metric: mean-square

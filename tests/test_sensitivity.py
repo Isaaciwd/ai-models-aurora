@@ -34,6 +34,24 @@ def test_parse_model_args_accepts_sensitivity_flags():
     assert args.sensitivity_metric == "mean"
 
 
+def test_parse_model_args_accepts_integrated_gradients_options():
+    model = _model_stub()
+    args = model.parse_model_args(
+        [
+            "--attribution-method",
+            "integrated-gradients",
+            "--ig-steps",
+            "12",
+            "--ig-baseline",
+            "climatology",
+        ]
+    )
+
+    assert args.attribution_method == "integrated-gradients"
+    assert args.ig_steps == 12
+    assert args.ig_baseline == "climatology"
+
+
 def test_parse_target_field_surface_and_pressure():
     model = _model_stub()
 
@@ -85,3 +103,21 @@ def test_default_target_dataclass_roundtrip():
     assert target.name == "west-coast-q700"
     assert target.field == "q700"
     assert target.metric == "mean-square"
+
+
+def test_zero_baseline_batch_is_zero_for_inputs():
+    model = _model_stub()
+    model.__dict__["device"] = "cpu"
+
+    batch = type("BatchLike", (), {})()
+    batch.surf_vars = {"2t": torch.randn(1, 2, 4, 4), "10u": torch.randn(1, 2, 4, 4)}
+    batch.atmos_vars = {"q": torch.randn(1, 2, len(model.levels), 4, 4)}
+    batch.static_vars = {}
+    batch.metadata = None
+
+    baseline = model._zero_baseline_batch(batch)
+
+    for tensor in baseline.surf_vars.values():
+        assert torch.allclose(tensor, torch.zeros_like(tensor))
+    for tensor in baseline.atmos_vars.values():
+        assert torch.allclose(tensor, torch.zeros_like(tensor))
