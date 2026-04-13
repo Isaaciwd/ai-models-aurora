@@ -6,5 +6,7 @@
 # nor does it submit to any jurisdiction.
 
 
-def test_code():
-    pass  # Empty for now
+def test_code_imports_plugin():
+    import ai_models_aurora.model as model_module
+
+    assert model_module is not None
