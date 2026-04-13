@@ -21,6 +21,7 @@ from ai_models.sensitivity import add_sensitivity_parser_arguments
 from ai_models.sensitivity import parse_target_area
 from ai_models.sensitivity import SensitivityTarget
 from ai_models.sensitivity import target_slug
+from torch.utils.checkpoint import checkpoint
 
 try:
     import timm.models.layers.helpers as _timm_helpers  # noqa: F401
@@ -346,9 +347,16 @@ class AuroraModel(Model):
         )
 
     def model_step(self, model, batch):
-        if self.rollout_checkpointing and torch.is_grad_enabled() and not self._warned_rollout_checkpointing:
-            LOG.warning("Rollout checkpointing is not implemented for Aurora batch objects; using regular forward")
-            self._warned_rollout_checkpointing = True
+        if self.rollout_checkpointing and torch.is_grad_enabled():
+            if not self._warned_rollout_checkpointing:
+                LOG.info("Rollout checkpointing enabled: rematerializing each Aurora rollout step")
+                self._warned_rollout_checkpointing = True
+
+            def _forward(batch_value):
+                return model(batch_value)
+
+            return checkpoint(_forward, batch, use_reentrant=False)
+
         return model(batch)
 
     @staticmethod
